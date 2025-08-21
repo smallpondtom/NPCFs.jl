@@ -1,6 +1,6 @@
 # NPCFs.jl
 
-**This is a fork of the original code [NPCFs.jl](https://github.com/oliverphilcox/NPCFs.jl).**
+**This is a fork of the original code [NPCFs.jl](https://github.com/oliverphilcox/NPCFs.jl). The package dependencies were updated to resolve version conflicts.**
 
 
 Efficient computation of isotropic N-point correlation function (NPCF) in Julia. This implements two algorithms to compute the NPCF of n particles in D dimensions: (1) a naive count over N-tuplets of particles, with complexity O(n^N), and (2) the O(n^2) algorithm of [Philcox & Slepian 2021](https://arxiv.org/abs/2106.10278), which makes use of hyperspherical harmonics to convert the computation into a pair count. In both cases, we compute the NPCF in the N-point basis discussed in [Philcox & Slepian 2021](https://arxiv.org/abs/2106.10278).
