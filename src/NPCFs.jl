@@ -1,5 +1,6 @@
 module NPCFs
 export NPCF, compute_npcf_simple, compute_npcf_pairwise, summarize, angular_indices
+export compute_npcf_pairwise_complete
 
 ### Load packages
 using Printf: @printf
@@ -83,8 +84,11 @@ julia> l1, l2, l3  = angular_indices(npcf); # return a list of ell indices corre
     _dr::Float64 = -1; # bin-size, computed from binning parameters
     _boxsize::Float64 = -1; # boxsize, computed from volume
 
+    # "Complete" flag for (r1 = r2) in 3PCF
+    complete::Bool = false; # whether to compute the "complete" 3PCF, including r1 = r2 bin
+
     # Check bounds and create object
-    function NPCF(N,D,coords,periodic,volume,nbins,r_min,r_max,lmax,verb,_dr,_boxsize)
+    function NPCF(N,D,coords,periodic,volume,nbins,r_min,r_max,lmax,verb,_dr,_boxsize,complete)
 
         # Check that derived parameters haven't been set
         @assert _boxsize==-1 "This will be reset on initialization!"
@@ -116,7 +120,7 @@ julia> l1, l2, l3  = angular_indices(npcf); # return a list of ell indices corre
             end
         end
 
-        npcf=new(N,D,coords,periodic,volume,nbins,r_min,r_max,lmax,verb,_dr,_boxsize)
+        npcf=new(N,D,coords,periodic,volume,nbins,r_min,r_max,lmax,verb,_dr,_boxsize,complete)
         if verb; summarize(npcf); end
         return npcf
     end
@@ -555,7 +559,13 @@ function _compute_npcf_pairwise(imin::Int64, imax::Int64, inputs::Matrix{Float64
             continue
         elseif npcf.N==3
             for b1 in 1:npcf.nbins
-                for b2 in b1+1:npcf.nbins
+                """
+                IMPORTANT CHANGE
+                """
+                b1_start = npccf.complete ? b1 : b1+1
+                # b1_start = b1 + 1 if NOT computing r1 = r2
+                # b1_start = b1 if computing r1 = r2
+                for b2 in b1_start:npcf.nbins     
                     # iterate over primary ells
                     for l1 in 0:npcf.lmax
 
@@ -667,6 +677,275 @@ function _compute_npcf_pairwise(imin::Int64, imax::Int64, inputs::Matrix{Float64
         end
     end
 
+    return output
+end;
+
+#==============================================================================#
+"""
+ADDITIONAL CORRECTION FUNCTION FOR r1 = r2
+"""
+#==============================================================================#
+
+"""
+    compute_npcf_simple_error(inputs, npcf)
+
+ONLY WORKS FOR 3PCF WITH r1 = r2 !!!!!!!!!!!!!!!!!!!
+"""
+function compute_npcf_simple_error(inputs::Matrix{Float64}, npcf::NPCF)
+
+    # First check inputs
+    check_inputs(inputs, npcf)
+
+    Npart = length(inputs[:,1])
+    if npcf.verb; @printf("\nAnalyzing dataset with %d particles using %d worker(s) by summing over all N-tuplets of galaxies\n",Npart,nworkers()); end
+
+    # Set up output array to hold NPCF
+    output = create_npcf_array(npcf)
+
+    # Work out how many workers are present and chunk memory
+    tasks_per_worker = div(Npart,nworkers())+1
+
+    # Now perform the chunking and run the algorithm across separate workers
+    if npcf.verb;
+        if nworkers()>1
+            println("Starting distributed computation");
+        else
+            println("Starting computation");
+        end
+    end
+    chunked_output = Dict{Int,Future}()
+    @sync for (w_i,w) in enumerate(workers())
+        imin = tasks_per_worker*(w_i-1)+1
+        imax = min(imin+tasks_per_worker,Npart+1)-1
+        @async chunked_output[w_i] = @spawnat w _compute_npcf_simple_error(imin, imax, inputs, npcf)
+    end
+
+    # Now combine the output together
+    for w_i in 1:nworkers()
+        output .+= chunked_output[w_i][]
+    end
+
+    # Apply normalization to the output array
+    normalize_npcf!(output, npcf)
+
+    if npcf.verb; @printf("Calculations complete!\n"); end
+
+    return output
+end;
+
+
+"""
+    _compute_npcf_simple_error(imin,imax,inputs,npcf)
+
+ONLY WORKS FOR 3PCF WITH r1 = r2 !!!!!!!!!!!!!!!!!!!
+"""
+function _compute_npcf_simple_error(imin::Int64, imax::Int64, inputs::Matrix{Float64}, npcf::NPCF)
+
+    Npart = length(inputs[:,1])
+    if npcf.verb;
+        if nworkers()>1
+            println("Running on thread id $(myid()) for particles $imin to $imax");
+        else
+            println("Iterating over primary particles");
+        end
+    end
+
+    # Set up output array for this worker
+    output = create_npcf_array(npcf)
+
+    # Define positions and weights
+    positions = inputs[:,1:npcf.D]
+    weights = inputs[:,npcf.D+1]
+
+    # Iterate over first particle in required range
+    for i in imin:imax
+
+        p1 = positions[i,:]
+        w1 = weights[i]
+
+        if npcf.coords=="spherical"
+            # Reorient points such that p1 is at the origin
+            shift_positions = reorient_points(positions,p1)
+        else
+            # Translate positions such that p1 is at the origin
+            shift_positions = positions
+            for ii in 1:npcf.D
+                shift_positions[:,ii] .-= p1[ii]
+            end
+            if npcf.periodic
+                periodic_wrapping!(shift_positions,npcf)
+            end
+        end
+
+        # Iterate over all secondary particles
+        for j in 1:Npart
+            p2 = shift_positions[j,:]
+            w12 = w1*weights[j]
+
+            # Find separation bin
+            sep12 = sep(p2,npcf)
+            bin12 = return_bin(sep12,npcf)
+            if bin12 == -1; continue; end
+
+            # Accumulate 2PCF [NOT RELEVANT HERE]
+            if npcf.N==2
+                output[bin12] += w12
+                continue
+            end
+
+            # Define unit vector
+            if npcf.coords=="cartesian"; p2 /= sep12; end
+
+            # FIX THIRD PARTICLE, SETTING j = k
+            w123 = w12*weights[j]
+
+            if npcf.N==3
+                # Compute NPCF contribution
+
+                for l in 0:npcf.lmax
+                    # Find basis vector
+                    basis = basis_3pcf(l,p2,p2,npcf)  # CHANGE p3 -> p2
+
+                    # Add to output array
+                    output[bin12,bin12,l+1] += w123*conj(basis)  # CHANGE bin13 -> bin12
+                end
+            else
+                # Iterate over fourth particle
+                for l in 1:Npart
+                    p4 = shift_positions[l,:]
+                    w1234 = w123*weights[l]
+
+                    if k==l; continue; end
+
+                    # Find separation bin
+                    sep14 = sep(p4,npcf)
+                    bin14 = return_bin(sep14,npcf)
+                    if bin14==-1 || bin14<=bin13; continue; end
+
+                    # Define unit vector
+                    if npcf.coords=="cartesian"; p4/=sep14; end
+
+                    if npcf.N==4
+                        # Compute NPCF contribution
+                        if npcf.D==2
+                            l_index = 1
+                            for l1_1 in -npcf.lmax:npcf.lmax
+                                for l2_1 in -npcf.lmax:npcf.lmax
+                                    l3_1 = -l1_1-l2_1
+                                    if abs(l3_1)>npcf.lmax || l3_1>0; continue; end
+
+                                    # Find basis vector
+                                    basis = basis_4pcf(l1_1,l2_1,l3_1,p2,p3,p4,npcf)
+
+                                    # Add to output array
+                                    output[bin12,bin13,bin14,l_index] += w1234*conj(basis)
+                                    l_index += 1
+                                end
+                            end
+                        elseif npcf.D>=3
+                            l_index  = 1
+                            for l1_2 in 0:npcf.lmax
+                                for l2_2 in 0:npcf.lmax
+                                    for l3_2 in abs(l1_2-l2_2):min(l1_2+l2_2,npcf.lmax)
+
+                                        # remove odd-parity NPCF contributions
+                                        if (-1)^(l1_2+l2_2+l3_2)==-1; continue; end
+
+                                        # Find basis vector
+                                        basis = basis_4pcf(l1_2,l2_2,l3_2,p2,p3,p4,npcf)
+
+                                        # Add to output array
+                                        output[bin12,bin13,bin14,l_index] += w1234*conj(basis)
+                                        l_index += 1
+                                    end
+                                end
+                            end
+                        end
+                    else
+                        # Iterate over fifth particle
+                        for m in 1:Npart
+                            p5 = shift_positions[m,:]
+                            w12345 = w1234*weights[m]
+
+                            if l==m; continue; end
+
+                            # Find separation bin
+                            sep15 = sep(p5,npcf)
+                            bin15 = return_bin(sep15,npcf)
+
+                            if bin15==-1 || bin15<=bin14; continue; end
+
+                            # Define unit vector
+                            if npcf.coords=="cartesian"; p5/=sep15; end
+
+                            if npcf.N==5
+                                # Compute NPCF contribution
+                                if npcf.D==2
+                                    l_index = 1
+                                    for l1_1 in -npcf.lmax:npcf.lmax
+                                        for l2_1 in -npcf.lmax:npcf.lmax
+                                            for l3_1 in -npcf.lmax:npcf.lmax
+                                                l4_1 = -l1_1-l2_1-l3_1
+                                                if abs(l4_1)>npcf.lmax || l4_1>0; continue; end
+
+                                                # Find basis vector
+                                                basis = basis_5pcf(l1_1,l2_1,l1_1+l2_1,l3_1,l4_1,p2,p3,p4,p5,npcf)
+
+                                                # Add to output array
+                                                output[bin12,bin13,bin14,bin15,l_index] += w12345*conj(basis)
+                                                l_index += 1
+                                            end
+                                        end
+                                    end
+                                elseif npcf.D>=3
+                                    l_index  = 1
+                                    for l1_2 in 0:npcf.lmax
+                                        for l2_2 in 0:npcf.lmax
+                                            for l12_2 in abs(l1_2-l2_2):l1_2+l2_2
+                                                for l3_2 in 0:npcf.lmax
+                                                    for l4_2 in abs(l12_2-l3_2):min(l12_2+l3_2,npcf.lmax)
+
+                                                        # remove odd-parity NPCF contributions
+                                                        if (-1)^(l1_2+l2_2+l3_2+l4_2)==-1; continue; end
+
+                                                        # Find basis vector
+                                                        basis = basis_5pcf(l1_2,l2_2,l12_2,l3_2,l4_2,p2,p3,p4,p5,npcf)
+
+                                                        # Add to output array
+                                                        output[bin12,bin13,bin14,bin15,l_index] += w12345*conj(basis)
+                                                        l_index += 1
+                                                    end
+                                                end
+                                            end
+                                        end
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return output
+end;
+
+
+"""
+    compute_npcf_pairwise_complete(inputs, npcf)
+
+Compute the NPCF using the pairwise method, including the additional correction 
+for r1 = r2 if required.
+"""
+function compute_npcf_pairwise_complete(inputs::Matrix{Float64}, npcf::NPCF)
+    @assert npcf.complete==true "The compute_npcf_pairwise_complete function should only be used when npcf.complete==true!"
+    output = compute_npcf_pairwise(inputs, npcf)
+    if npcf.N==3
+        output_error = compute_npcf_simple_error(inputs, npcf)
+        output .-= output_error
+    else
+        error("Not yet implemented!")
+    end
     return output
 end;
 
