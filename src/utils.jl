@@ -286,6 +286,11 @@ For spherical coordinates, we assume that `r1` and `r2` are rotated such that th
 function basis_3pcf(l,r1,r2,npcf::NPCF)
     if npcf.coords=="cartesian"
         mu = sum(r1.*r2)
+        if isapprox(mu, 1.0; atol=1e-4)
+            mu = 1.0
+        elseif isapprox(mu, -1.0; atol=1e-4)
+            mu = -1.0
+        end
     end
 
     if npcf.D==2
