@@ -562,7 +562,7 @@ function _compute_npcf_pairwise(imin::Int64, imax::Int64, inputs::Matrix{Float64
                 """
                 IMPORTANT CHANGE
                 """
-                b1_start = npccf.complete ? b1 : b1+1
+                b1_start = npcf.complete ? b1 : b1+1
                 # b1_start = b1 + 1 if NOT computing r1 = r2
                 # b1_start = b1 if computing r1 = r2
                 for b2 in b1_start:npcf.nbins     
